@@ -1,0 +1,17 @@
+.gradle/
+build/
+out/
+*.class
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+.vscode/
+.DS_Store
+
+local.properties
+gradle-app.setting
+!gradle/wrapper/gradle-wrapper.jar
+.gradletasknamecache
