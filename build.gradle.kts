@@ -21,6 +21,11 @@ repositories {
 dependencies {
     api("com.google.code.gson:gson:2.10.1")
     implementation("org.yaml:snakeyaml:2.2")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 tasks.withType<JavaCompile> {

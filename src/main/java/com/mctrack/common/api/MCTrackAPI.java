@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
@@ -28,6 +29,9 @@ public class MCTrackAPI {
     private static final long BASE_BACKOFF_MS = 1000;
     // Maximum backoff delay (in milliseconds)
     private static final long MAX_BACKOFF_MS = 60_000;
+    // 1s, 2s, 4s, 8s, 16s, 32s, then the 60s cap. Keeping the
+    // exponent bounded also prevents long-shift/multiplication overflow.
+    private static final int MAX_BACKOFF_EXPONENT = 6;
     // Maximum time to spend attempting a final flush during plugin shutdown
     private static final long SHUTDOWN_FLUSH_TIMEOUT_MS = 2_000;
     // Per-request timeout used for the final shutdown flush
@@ -41,6 +45,7 @@ public class MCTrackAPI {
     private final Gson gson;
     private final ConcurrentLinkedQueue<QueuedEvent> eventQueue = new ConcurrentLinkedQueue<>();
     private final ReentrantLock flushLock = new ReentrantLock();
+    private final AtomicBoolean immediateFlushScheduled = new AtomicBoolean(false);
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "MCTrack-API");
         t.setDaemon(true);
@@ -76,7 +81,7 @@ public class MCTrackAPI {
         fetchApiKeyInfo();
 
         batchJob = scheduler.scheduleAtFixedRate(
-            this::flushEvents,
+            this::flushEventsSafely,
             config.getBatchInterval(),
             config.getBatchInterval(),
             TimeUnit.SECONDS
@@ -301,12 +306,59 @@ public class MCTrackAPI {
 
         eventQueue.add(new QueuedEvent(event));
         if (eventQueue.size() >= config.getBatchSize()) {
-            try {
-                scheduler.execute(this::flushEvents);
-            } catch (RejectedExecutionException ignored) {
-                // Plugin is shutting down; queued events are handled by stop().
-            }
+            requestImmediateFlush();
         }
+    }
+
+    /**
+     * Keep at most one immediate flush task in the executor queue. During an
+     * outage, scheduling one task for every incoming event creates an unbounded
+     * executor backlog on top of the bounded event queue. The task chains
+     * another flush only when a full batch remains.
+     */
+    private void requestImmediateFlush() {
+        if (!started || stopping || !immediateFlushScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            scheduler.execute(() -> {
+                try {
+                    flushEventsSafely();
+                } finally {
+                    immediateFlushScheduled.set(false);
+                    if (started && !stopping && eventQueue.size() >= config.getBatchSize()) {
+                        requestImmediateFlush();
+                    }
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            immediateFlushScheduled.set(false);
+            // Plugin is shutting down; queued events are handled by stop().
+        }
+    }
+
+    /**
+     * A ScheduledExecutorService suppresses every future fixed-rate execution
+     * after one unchecked exception. Never let a malformed retry state stop the
+     * sender permanently; the queue should recover without a plugin reload.
+     */
+    private void flushEventsSafely() {
+        try {
+            flushEvents();
+        } catch (RuntimeException e) {
+            logger.accept("[MCTrack] Unexpected event flush failure; sender will retry: " + e.getMessage());
+        }
+    }
+
+    static long calculateBackoffMs(int failures) {
+        if (failures <= 0) {
+            return 0;
+        }
+
+        int exponent = Math.min(failures - 1, MAX_BACKOFF_EXPONENT);
+        long delay = BASE_BACKOFF_MS * (1L << exponent);
+        return Math.min(delay, MAX_BACKOFF_MS);
     }
 
     private void flushEvents() {
@@ -316,7 +368,7 @@ public class MCTrackAPI {
         try {
             // Apply exponential backoff if there have been consecutive failures
             if (consecutiveFailures > 0) {
-                long backoffMs = Math.min(BASE_BACKOFF_MS * (1L << (consecutiveFailures - 1)), MAX_BACKOFF_MS);
+                long backoffMs = calculateBackoffMs(consecutiveFailures);
                 if (config.isDebug()) {
                     logger.accept("[MCTrack] Applying backoff delay of " + backoffMs + "ms due to " + consecutiveFailures + " consecutive failures");
                 }
@@ -344,7 +396,9 @@ public class MCTrackAPI {
                 }
 
                 // Increment consecutive failures for exponential backoff
-                consecutiveFailures++;
+                if (consecutiveFailures < Integer.MAX_VALUE) {
+                    consecutiveFailures++;
+                }
                 logger.accept("[MCTrack] Failed to send events (failure #" + consecutiveFailures + "): " + e.getMessage());
 
                 int discardedCount = requeueEvents(queuedEvents, true);
